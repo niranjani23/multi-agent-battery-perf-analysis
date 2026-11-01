@@ -1,0 +1,210 @@
+Case Study: Building a Multi-Agent Battery Performance Analysis System
+=====================================================================
+
+THE PROBLEM
+-----------
+
+Battery storage operators need to understand why their asset underperformed relative to
+what was theoretically achievable. The dataset — one week of 5-minute interval data for
+the Blyth Battery (BLYTHB1) — contained four scenario/schedule combinations:
+historical/cleared, historical/expected, perfect/cleared, and perfect/expected.
+
+The core analytical question was: how large is the revenue gap between how the battery
+actually operated (historical) and how it could have operated with perfect foresight
+(perfect), and what drove that gap?
+
+Answering this manually is tedious: you must cross-reference dispatch decisions, spot
+price movements, and SOC trajectories across hundreds of intervals. The goal was to
+automate that reasoning with an LLM-based agent system that could ingest raw CSV data
+and produce a structured, evidence-grounded report — without hallucinating conclusions
+that the data doesn't support.
+
+The additional constraint: recommendations had to be actionable and traceable back to
+specific numerical evidence, not generic energy-storage advice.
+
+
+WHAT WAS BUILT
+--------------
+
+A three-agent pipeline orchestrated by a coordinator, all built on the raw Anthropic
+Claude API (no frameworks). Each agent owns a narrow responsibility and communicates
+only through JSON summaries — never raw data rows.
+
+  Agent 1 — Data Prep: loads and validates the CSV, normalises datetimes, splits
+  rows by scenario × schedule combination, and returns a clean data manifest. If the
+  schema is wrong, the pipeline stops here before spending any LLM tokens on analysis.
+
+  Agent 2 — Analysis: runs five tools in a defined sequence — revenue summary,
+  high-price interval identification, dispatch comparison, SOC profiling, and finally
+  gap-driver synthesis. The last tool (find_gap_drivers) requires all four prior
+  outputs as explicit arguments, enforcing multi-step reasoning.
+
+  Agent 3 — Recommendation: produces exactly two actionable recommendations. Its
+  system prompt forbids conclusions not anchored to evidence keywords from the analysis
+  output. The generate_recommendations tool validates this before returning.
+
+  Orchestrator: sequences the three agents, passes results between them, extracts
+  cached tool outputs from module-level state, and assembles the final report dict
+  including a ReportLab PDF.
+
+Two interfaces were built: a Streamlit UI (file upload → run → download PDF) and a
+Rich-formatted CLI (python -m battery_agent.main path/to/data.csv).
+
+  Folder structure (16 files)
+
+  battery_agent/
+  ├── main.py                   # CLI with Rich terminal output
+  ├── orchestrator.py           # Pipeline coordinator
+  ├── agents/
+  │   ├── base.py               # Shared tool_use loop (exact pseudo-code from
+  plan)
+  │   ├── data_prep.py          # Data Prep sub-agent
+  │   ├── analysis.py           # Analysis sub-agent
+  │   └── recommendations.py    # Recommendation sub-agent
+  ├── tools/
+  │   ├── data_tools.py         # load_csv, validate_schema, clean_data,
+  summarize_shape
+  │   ├── analysis_tools.py     # revenue, high-price, dispatch, SOC, gap
+  drivers
+  │   └── rec_tools.py          # generate_recommendations (with evidence
+  validation)
+  ├── report/pdf_generator.py   # ReportLab Platypus PDF
+  ├── ui/app.py                 # Streamlit UI
+  ├── requirements.txt
+  └── README.md
+
+  Key design decisions implemented
+
+  - Module-level state (data_tools._state) holds the cleaned DataFrame — the
+  LLM never receives raw CSV rows, only JSON summaries
+  - find_gap_drivers requires all 4 prior outputs as explicit parameters,
+  enforcing the multi-step reasoning chain
+  - generate_recommendations rejects recommendations that don't reference
+  analysis evidence keywords, preventing hallucination
+  - Fail-fast: validate_schema runs before any LLM tokens are spent on analysis
+
+  How to run
+
+  # Install
+  pip install -r battery_agent/requirements.txt
+
+  # Add ANTHROPIC_API_KEY to a .env file, then:
+  streamlit run battery_agent/ui/app.py
+
+  # Or CLI:
+  python -m battery_agent.main path/to/data.csv
+
+
+WHAT WORKED
+-----------
+
+1. The tool_use loop as the core abstraction.
+   Writing a single run_agent_loop() in base.py and having every sub-agent call it
+   made the orchestration pattern explicit and easy to debug. The loop logs each tool
+   call and result in real time, so you can watch the model's reasoning unfold step
+   by step. This transparency was valuable — it made it immediately obvious when the
+   model called tools in the wrong order or passed stale arguments.
+
+2. Module-level state as a data bus.
+   Storing the cleaned DataFrame in data_tools._state meant no agent ever had to
+   serialise a 1,150-row dataset into a prompt. Every downstream tool just called
+   _get_clean_df() and got a live reference. This kept token usage low and eliminated
+   an entire class of prompt-injection risk (a user can't sneak malicious content into
+   the analysis via a crafted CSV row if the model never reads the rows).
+
+3. Fail-fast schema validation.
+   validate_schema() runs before the analysis agent is even instantiated. On a
+   malformed CSV, the pipeline returns a clean error in milliseconds rather than
+   burning through several LLM calls before hitting a pandas KeyError midway through
+   the analysis chain.
+
+4. find_gap_drivers with required parameters.
+   Making the final synthesis tool require all four prior outputs as named arguments
+   forced the model to actually run those tools first. The module-level _results cache
+   serves as a fallback if the model passes empty dicts, but the explicit parameter
+   contract in the tool definition reliably produced the right call sequence.
+
+5. Evidence validation in recommendations.
+   The generate_recommendations tool checks that each recommendation's reasoning
+   string contains at least one keyword pulled from the analysis output (e.g., a dollar
+   figure, a percentage, the word "SOC", or a dispatch term). This is a lightweight
+   but effective guard against the model producing plausible-sounding but groundless
+   advice.
+
+6. Separation of the two interfaces.
+   Keeping the Streamlit UI and the CLI as thin shells over orchestrator.run_analysis()
+   meant the core pipeline could be tested independently. The log_callback parameter
+   let both interfaces receive live progress messages without any coupling to display
+   logic.
+
+
+WHAT DID NOT WORK
+-----------------
+
+1. Relying on the model to call tools in the specified order without enforcement.
+   The analysis agent's system prompt specifies the exact sequence: revenue summary →
+   high-price intervals → dispatch comparison → SOC → gap drivers. The model usually
+   follows this, but not always. On some runs it called compare_dispatch before
+   identify_high_price_intervals, which technically works (the tools are stateless
+   reads from the same DataFrame) but breaks the intended reasoning chain. The
+   find_gap_drivers required-parameters contract helped, but did not fully solve the
+   ordering problem. A more robust fix would be to expose only the next tool in
+   sequence at each step, rather than presenting all five at once.
+
+2. Module-level state breaks under concurrent requests.
+   data_tools._state and analysis_tools._results are module globals. In the Streamlit
+   app, if two users upload CSVs and click Run Analysis at the same time, the second
+   user's data prep call overwrites the first user's cleaned DataFrame. For a single-
+   user local tool this is acceptable, but it would be a correctness bug in any
+   multi-user deployment. A proper fix is to pass a session-scoped state object through
+   the call chain instead of relying on module globals.
+
+3. PDF layout was fragile with long text.
+   ReportLab Platypus handles word wrapping, but evidence strings generated by
+   find_gap_drivers can be quite long and contain dollar signs and percentage signs
+   that needed escaping. On the first run, a few reports had truncated text in table
+   cells because the column widths were too narrow for the generated strings. This
+   required manual tuning of column proportions and was not fully generalised.
+
+4. The recommendation validation heuristic is too shallow.
+   Checking for keyword presence is a necessary but not sufficient guard. The model
+   can technically satisfy the check by mentioning "SOC" in passing while the actual
+   recommendation is still generic. A stronger approach would be to extract the
+   specific numerical claims from the analysis JSON and require the recommendation
+   to reproduce at least one verbatim figure — but this was not implemented.
+
+5. No retry logic on API errors.
+   The agent loop has a MAX_ITERATIONS cap but no handling for transient API failures
+   (rate limits, 529 overload). On a slow connection or under API load, a single failed
+   messages.create() call raises an exception that propagates up and kills the whole
+   pipeline. Adding exponential backoff around the API call would make the system
+   meaningfully more robust.
+
+
+THE OUTCOME
+-----------
+
+The pipeline runs end-to-end in roughly 30–60 seconds on the BLYTHB1 dataset,
+producing a structured PDF report with: a data manifest, revenue gap quantification
+(both dollar value and percentage), top missed dispatch intervals with timestamps
+and prices, SOC constraint analysis, two evidence-grounded recommendations, and a
+summary narrative.
+
+The multi-agent structure paid off primarily in debuggability. Because each agent
+has a narrow scope and every tool call is logged, it is easy to pinpoint exactly
+where a result deviated from expectations — whether that was a data quality issue
+caught at validation, a tool called out of order, or a weak recommendation that
+didn't cite enough evidence.
+
+The main architectural lesson: keep the LLM out of your data pipeline. Every place
+where raw data was kept in Python and only summaries were passed to the model, the
+system was fast, correct, and cheap to run. The one place where the model had
+implicit influence over data flow — tool call ordering — was also the most frequent
+source of subtle bugs.
+
+For a take-home or prototype, the module-global state and shallow validation
+heuristics are acceptable trade-offs. For a production system, the two changes with
+the highest leverage would be: (1) replace module globals with a session-scoped
+context object, and (2) expose tools incrementally rather than all at once, so the
+model cannot deviate from the intended reasoning sequence.
+

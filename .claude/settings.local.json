@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"/c/Users/niran/OneDrive/Documents/Niranjani-Personal/sub-agent-battery-perf-analysis/battery_agent/tools\")",
+      "Bash(mkdir -p \"/c/Users/niran/OneDrive/Documents/Niranjani-Personal/sub-agent-battery-perf-analysis/battery_agent/agents\")",
+      "Bash(mkdir -p \"/c/Users/niran/OneDrive/Documents/Niranjani-Personal/sub-agent-battery-perf-analysis/battery_agent/report\")",
+      "Bash(mkdir -p \"/c/Users/niran/OneDrive/Documents/Niranjani-Personal/sub-agent-battery-perf-analysis/battery_agent/ui\")",
+      "Bash(pip install:*)",
+      "Bash(streamlit run:*)",
+      "Bash(xargs grep:*)",
+      "Bash(find:*)"
+    ]
+  }
+}
